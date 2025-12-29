@@ -1,4 +1,4 @@
-package middleware
+package app
 
 import (
 	"cloud.google.com/go/firestore"

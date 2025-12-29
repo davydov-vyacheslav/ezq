@@ -2,23 +2,25 @@ package routes
 
 import (
 	"ezqueue/app"
+	"ezqueue/auth"
 	"ezqueue/handlers"
 )
 
-func SetupRoutes(app *app.App) {
+func SetupRoutes(app *app.App, providers map[string]auth.Provider) {
 
-	authHandler := handlers.NewAuthHandler(app)
+	authHandler := handlers.NewAuthHandler(app, providers)
 	queueHandler := handlers.NewQueueHandler(app)
 	ticketHandler := handlers.NewTicketHandler(app)
 
-	api := app.Router.Group("/api/v1")
+	// public routes
+	app.Router.POST("/auth/login", authHandler.Login)
+	app.Router.POST("/auth/refresh", authHandler.Refresh)
 
-	// Public routes
-	api.POST("/auth/google", authHandler.HandleGoogleAuth)
+	api := app.Router.Group("/api/v1")
 
 	// Protected routes
 	protected := api.Group("")
-	protected.Use(app.AuthMiddleware())
+	protected.Use(authHandler.JWTAuth)
 	{
 		// User routes
 		protected.GET("/users/me", authHandler.GetCurrentUser)

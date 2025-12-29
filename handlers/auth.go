@@ -1,85 +1,165 @@
 package handlers
 
 import (
+	"context"
 	"ezqueue/app"
-	"ezqueue/models"
-	"net/http"
+	"ezqueue/auth"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
 type AuthHandler struct {
-	App *app.App
+	App         *app.App
+	Providers   map[string]auth.Provider
+	RefreshRepo *auth.RefreshTokenRepo
+	UserRepo    *auth.UserRepo
 }
 
-func NewAuthHandler(application *app.App) *AuthHandler {
-	return &AuthHandler{App: application}
+func NewAuthHandler(application *app.App, providers map[string]auth.Provider) *AuthHandler {
+	return &AuthHandler{
+		App:         application,
+		Providers:   providers,
+		RefreshRepo: &auth.RefreshTokenRepo{Client: application.FSClient},
+		UserRepo:    &auth.UserRepo{Client: application.FSClient},
+	}
 }
 
-type GoogleAuthRequest struct {
-	IDToken string `json:"idToken" binding:"required"`
-}
-
-func (h *AuthHandler) HandleGoogleAuth(c *gin.Context) {
-	var req GoogleAuthRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+func (h *AuthHandler) JWTAuth(c *gin.Context) {
+	header := c.GetHeader("Authorization")
+	if !strings.HasPrefix(header, "Bearer ") {
+		c.AbortWithStatus(401)
 		return
 	}
 
-	token, err := h.App.AuthClient.VerifyIDToken(c.Request.Context(), req.IDToken)
+	token := strings.TrimPrefix(header, "Bearer ")
+	claims, err := auth.ParseAccessToken(token)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+		c.AbortWithStatus(401)
 		return
 	}
 
-	// Get or create user
-	userDoc := h.App.FSClient.Collection("users").Doc(token.UID)
-	doc, err := userDoc.Get(c.Request.Context())
+	c.Set("user_id", claims.UserID)
+	c.Set("roles", claims.Roles)
+	c.Next()
 
-	var user models.User
-	if err != nil {
-		// Create new user
-		user = models.User{
-			ID:          token.UID,
-			Email:       token.Claims["email"].(string),
-			DisplayName: token.Claims["name"].(string),
-			PhotoURL:    token.Claims["picture"].(string),
-			CreatedAt:   time.Now(),
-		}
-
-		_, err = userDoc.Set(c.Request.Context(), user)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
-			return
-		}
-	} else {
-		if err := doc.DataTo(&user); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse user"})
-			return
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"user":  user,
-		"token": req.IDToken,
-	})
 }
 
 func (h *AuthHandler) GetCurrentUser(c *gin.Context) {
-	userID := c.GetString("userID")
-	doc, err := h.App.FSClient.Collection("users").Doc(userID).Get(c.Request.Context())
+
+	c.JSON(200, gin.H{
+		"user_id": c.GetString("user_id"),
+	})
+
+	//userID := c.GetString("user_id")
+	//doc, err := h.App.FSClient.Collection("users").Doc(userID).Get(c.Request.Context())
+	//if err != nil {
+	//	c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+	//	return
+	//}
+	//
+	//var user models.User
+	//if err := doc.DataTo(&user); err != nil {
+	//	c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse user"})
+	//	return
+	//}
+	//
+	//c.JSON(http.StatusOK, user)
+}
+
+type LoginRequest struct {
+	Provider string `json:"provider"`
+	Token    string `json:"token"`
+}
+
+func (a *AuthHandler) Login(c *gin.Context) {
+	var req LoginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "bad request"})
+		return
+	}
+
+	provider, ok := a.Providers[req.Provider]
+	if !ok {
+		c.JSON(400, gin.H{"error": "unknown provider"})
+		return
+	}
+
+	userInfo, err := provider.Verify(context.Background(), req.Token)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		c.JSON(401, gin.H{"error": "invalid token"})
 		return
 	}
 
-	var user models.User
-	if err := doc.DataTo(&user); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse user"})
+	userID, err := a.UserRepo.FindOrCreateUser(
+		context.Background(),
+		*userInfo,
+	)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to find or create user"})
 		return
 	}
 
-	c.JSON(http.StatusOK, user)
+	roles := []string{"user"}
+
+	access, _ := auth.GenerateAccessToken(userID, userInfo.Email, roles)
+	refreshToken, expires := auth.GenerateRefreshToken()
+	hash := auth.HashToken(refreshToken)
+
+	_ = a.RefreshRepo.Save(c, hash, userID, expires)
+
+	c.JSON(200, gin.H{
+		"access_token":  access,
+		"refresh_token": refreshToken,
+	})
+}
+
+type RefreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+func (a *AuthHandler) Refresh(c *gin.Context) {
+	var req RefreshRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "bad request"})
+		return
+	}
+
+	tokenHash := auth.HashToken(req.RefreshToken)
+
+	rt, err := a.RefreshRepo.Get(context.Background(), tokenHash)
+	if err != nil {
+		// ❗ token не найден → возможно reuse → можно инвалидировать все refresh пользователя
+		c.JSON(401, gin.H{"error": "invalid refresh token"})
+		return
+	}
+
+	// TODO: verify signature
+
+	if time.Now().After(rt.ExpiresAt) {
+		a.RefreshRepo.Delete(context.Background(), tokenHash)
+		c.JSON(401, gin.H{"error": "refresh token expired"})
+		return
+	}
+
+	// 🔥 ROTATION
+	_ = a.RefreshRepo.Delete(context.Background(), tokenHash)
+
+	// new tokens
+	access, _ := auth.GenerateAccessToken(rt.UserID, "", []string{"user"})
+	newRefresh, expires := auth.GenerateRefreshToken()
+	newHash := auth.HashToken(newRefresh)
+
+	_ = a.RefreshRepo.Save(
+		context.Background(),
+		newHash,
+		rt.UserID,
+		expires,
+	)
+
+	c.JSON(200, gin.H{
+		"access_token":  access,
+		"refresh_token": newRefresh,
+	})
 }

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"ezqueue/app"
+	"ezqueue/auth"
+	"ezqueue/auth/providers"
 	"ezqueue/routes"
 	"log"
 	"os"
@@ -22,7 +24,13 @@ func main() {
 	}
 	defer app.FSClient.Close()
 
-	routes.SetupRoutes(app)
+	var providersMap = map[string]auth.Provider{
+		"google": &providers.GoogleProvider{
+			ClientID: os.Getenv("GOOGLE_CLIENT_ID"),
+		},
+	}
+
+	routes.SetupRoutes(app, providersMap)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -65,6 +73,7 @@ func initializeApp() (*app.App, error) {
 	}, nil
 }
 
+// FIXME: setup cors properly
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
